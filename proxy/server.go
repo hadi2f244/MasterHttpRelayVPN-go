@@ -12,6 +12,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -30,16 +31,21 @@ import (
 	"masterhttprelayvpn/relay"
 )
 
-// ─── Response cache ──────────────────────────────────────────────────────────
+// ─── Response cache (LRU) ───────────────────────────────────────────────────
+
+// reMaxAge is pre-compiled once at init time.
+var reMaxAge = regexp.MustCompile(`max-age=(\d+)`)
 
 type cacheEntry struct {
+	key     string
 	raw     []byte
 	expires time.Time
 }
 
 type responseCache struct {
 	mu      sync.Mutex
-	store   map[string]cacheEntry
+	ll      *list.List
+	items   map[string]*list.Element
 	size    int
 	maxSize int
 	hits    int64
@@ -48,7 +54,8 @@ type responseCache struct {
 
 func newResponseCache(maxMB int) *responseCache {
 	return &responseCache{
-		store:   make(map[string]cacheEntry),
+		ll:      list.New(),
+		items:   make(map[string]*list.Element),
 		maxSize: maxMB * 1024 * 1024,
 	}
 }
@@ -56,17 +63,20 @@ func newResponseCache(maxMB int) *responseCache {
 func (c *responseCache) get(key string) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e, ok := c.store[key]
+	el, ok := c.items[key]
 	if !ok {
 		c.misses++
 		return nil
 	}
+	e := el.Value.(*cacheEntry)
 	if time.Now().After(e.expires) {
 		c.size -= len(e.raw)
-		delete(c.store, key)
+		c.ll.Remove(el)
+		delete(c.items, key)
 		c.misses++
 		return nil
 	}
+	c.ll.MoveToFront(el) // mark recently used
 	c.hits++
 	return e.raw
 }
@@ -80,18 +90,30 @@ func (c *responseCache) put(key string, raw []byte, ttl int) {
 	if len(raw) > c.maxSize/4 {
 		return
 	}
-	for c.size+len(raw) > c.maxSize && len(c.store) > 0 {
-		// evict arbitrary entry
-		for k, v := range c.store {
-			c.size -= len(v.raw)
-			delete(c.store, k)
+	// Evict LRU entries until there is room
+	for c.size+len(raw) > c.maxSize {
+		back := c.ll.Back()
+		if back == nil {
 			break
 		}
+		e := back.Value.(*cacheEntry)
+		c.size -= len(e.raw)
+		c.ll.Remove(back)
+		delete(c.items, e.key)
 	}
-	if old, ok := c.store[key]; ok {
-		c.size -= len(old.raw)
+	// Update existing entry
+	if el, ok := c.items[key]; ok {
+		e := el.Value.(*cacheEntry)
+		c.size -= len(e.raw)
+		e.raw = raw
+		e.expires = time.Now().Add(time.Duration(ttl) * time.Second)
+		c.size += len(raw)
+		c.ll.MoveToFront(el)
+		return
 	}
-	c.store[key] = cacheEntry{raw: raw, expires: time.Now().Add(time.Duration(ttl) * time.Second)}
+	e := &cacheEntry{key: key, raw: raw, expires: time.Now().Add(time.Duration(ttl) * time.Second)}
+	el := c.ll.PushFront(e)
+	c.items[key] = el
 	c.size += len(raw)
 }
 
@@ -108,8 +130,7 @@ func parseTTL(raw []byte, url string) int {
 	if strings.Contains(hdr, "no-store") || strings.Contains(hdr, "private") || strings.Contains(hdr, "set-cookie:") {
 		return 0
 	}
-	re := regexp.MustCompile(`max-age=(\d+)`)
-	if m := re.FindStringSubmatch(hdr); m != nil {
+	if m := reMaxAge.FindStringSubmatch(hdr); m != nil {
 		val, _ := strconv.Atoi(m[1])
 		if val > 86400 {
 			val = 86400
@@ -890,7 +911,7 @@ func parseHeaders(block []byte) map[string]string {
 	lines := bytes.Split(block, []byte("\r\n"))
 	for _, line := range lines[1:] {
 		if idx := bytes.IndexByte(line, ':'); idx > 0 {
-			k := strings.TrimSpace(string(line[:idx]))
+			k := strings.ToLower(strings.TrimSpace(string(line[:idx])))
 			v := strings.TrimSpace(string(line[idx+1:]))
 			hdrs[k] = v
 		}
@@ -898,13 +919,10 @@ func parseHeaders(block []byte) map[string]string {
 	return hdrs
 }
 
+// headerValue returns the value for the given lowercase header name.
+// All header maps in this package store keys in lowercase (via parseHeaders).
 func headerValue(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.ToLower(k) == name {
-			return v
-		}
-	}
-	return ""
+	return headers[name]
 }
 
 func shorten(s string, n int) string {

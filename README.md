@@ -128,6 +128,7 @@ Set your system/browser proxy to:
 | [docs/apps-script-setup.md](docs/apps-script-setup.md) | How to deploy and configure the Google Apps Script relay |
 | [docs/routing.md](docs/routing.md) | Routing decision tree — direct, SNI-rewrite, and MITM strategies |
 | [docs/mitm-ca.md](docs/mitm-ca.md) | MITM CA certificate installation on macOS, Linux, Windows, and Firefox |
+| [docs/performance-plan.md](docs/performance-plan.md) | Prioritised performance roadmap — v0.2.0 through v1.0.0 |
 
 ---
 

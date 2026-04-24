@@ -14,7 +14,7 @@ import (
 	"masterhttprelayvpn/proxy"
 )
 
-const version = "1.0.0"
+const version = "0.2.0"
 
 func main() {
 	cfgPath := flag.String("config", envOr("DFT_CONFIG", "config.json"), "Path to config file")

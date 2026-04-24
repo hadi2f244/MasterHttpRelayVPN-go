@@ -9,6 +9,7 @@
 package relay
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -43,6 +44,22 @@ var largeExts = []string{
 	".pdf", ".doc", ".docx", ".ppt", ".pptx", ".wasm",
 }
 
+// ─── pre-compiled regexps ─────────────────────────────────────────────────────
+
+var (
+	reStatusCode   = regexp.MustCompile(`\d{3}`)
+	reContentRange = regexp.MustCompile(`/(\d+)`)
+	reJSONExtract  = regexp.MustCompile(`(?s)\{.*\}`)
+	reStatus206    = regexp.MustCompile(` 206[^\r]*`)
+)
+
+// ─── buffer pools ─────────────────────────────────────────────────────────────
+
+var (
+	bufPool8k  = sync.Pool{New: func() any { b := make([]byte, 8192);  return &b }}
+	bufPool64k = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
+)
+
 // ─── pooled connection ────────────────────────────────────────────────────────
 
 type poolConn struct {
@@ -68,10 +85,11 @@ type Fronter struct {
 	authKey string
 
 	// Connection pool
-	mu      sync.Mutex
-	pool    []poolConn
-	poolMax int
-	connTTL time.Duration
+	mu              sync.Mutex
+	pool            []poolConn
+	poolMax         int
+	connTTL         time.Duration
+	tlsSessionCache tls.ClientSessionCache
 
 	// Concurrency limit
 	sem chan struct{}
@@ -123,17 +141,18 @@ func New(cfg Config) *Fronter {
 		cfg.ConnTTL = 45 * time.Second
 	}
 	f := &Fronter{
-		connectAddr:  cfg.ConnectAddr,
-		sniHost:      cfg.SNIHost,
-		httpHost:     cfg.HTTPHost,
-		authKey:      cfg.AuthKey,
-		scriptIDs:    cfg.ScriptIDs,
-		verifySSL:    cfg.VerifySSL,
-		poolMax:      cfg.PoolMax,
-		connTTL:      cfg.ConnTTL,
-		sem:          make(chan struct{}, 50),
-		batchEnabled: true,
-		coalesce:     make(map[string][]chan coalesceResult),
+		connectAddr:     cfg.ConnectAddr,
+		sniHost:         cfg.SNIHost,
+		httpHost:        cfg.HTTPHost,
+		authKey:         cfg.AuthKey,
+		scriptIDs:       cfg.ScriptIDs,
+		verifySSL:       cfg.VerifySSL,
+		poolMax:         cfg.PoolMax,
+		connTTL:         cfg.ConnTTL,
+		tlsSessionCache: tls.NewLRUClientSessionCache(64),
+		sem:             make(chan struct{}, 50),
+		batchEnabled:    true,
+		coalesce:        make(map[string][]chan coalesceResult),
 	}
 	// Pre-fill semaphore capacity
 	for i := 0; i < 50; i++ {
@@ -148,7 +167,8 @@ func New(cfg Config) *Fronter {
 
 func (f *Fronter) dial() (net.Conn, error) {
 	tlsCfg := &tls.Config{
-		ServerName: f.sniHost,
+		ServerName:         f.sniHost,
+		ClientSessionCache: f.tlsSessionCache,
 	}
 	if !f.verifySSL {
 		tlsCfg.InsecureSkipVerify = true
@@ -320,7 +340,7 @@ func (f *Fronter) RelayParallel(ctx context.Context, method, url string, headers
 	}
 
 	cr := respHdrs["content-range"]
-	m := regexp.MustCompile(`/(\d+)`).FindStringSubmatch(cr)
+	m := reContentRange.FindStringSubmatch(cr)
 	if m == nil {
 		return rewrite206to200(firstResp), nil
 	}
@@ -571,9 +591,11 @@ func (f *Fronter) relaySingle(ctx context.Context, payload map[string]interface{
 	}
 
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+	bw := bufio.NewWriterSize(conn, len(jsonBody)+512)
+	fmt.Fprintf(bw, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
 		path, f.httpHost, len(jsonBody))
-	if _, err := conn.Write(append([]byte(req), jsonBody...)); err != nil {
+	bw.Write(jsonBody)
+	if err := bw.Flush(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write: %w", err)
 	}
@@ -645,9 +667,11 @@ func (f *Fronter) relayBatch(ctx context.Context, payloads []map[string]interfac
 	}
 
 	conn.SetDeadline(time.Now().Add(35 * time.Second))
-	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+	bw := bufio.NewWriterSize(conn, len(jsonBody)+512)
+	fmt.Fprintf(bw, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
 		path, f.httpHost, len(jsonBody))
-	if _, err := conn.Write(append([]byte(req), jsonBody...)); err != nil {
+	bw.Write(jsonBody)
+	if err := bw.Flush(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("write batch: %w", err)
 	}
@@ -728,7 +752,9 @@ func (f *Fronter) buildPayload(method, url string, headers map[string]string, bo
 
 func readHTTPResponse(conn net.Conn) (status int, headers map[string]string, body []byte, err error) {
 	buf := make([]byte, 0, 8192)
-	tmp := make([]byte, 8192)
+	tmpPtr := bufPool8k.Get().(*[]byte)
+	tmp := *tmpPtr
+	defer bufPool8k.Put(tmpPtr)
 	headers = make(map[string]string)
 
 	// Read until we have the header section
@@ -760,9 +786,7 @@ func readHTTPResponse(conn net.Conn) (status int, headers map[string]string, bod
 	if len(lines) == 0 {
 		return 0, headers, nil, fmt.Errorf("empty response")
 	}
-	re := regexp.MustCompile(`\d{3}`)
-	m := re.Find(lines[0])
-	if m != nil {
+	if m := reStatusCode.Find(lines[0]); m != nil {
 		status, _ = strconv.Atoi(string(m))
 	}
 	for _, line := range lines[1:] {
@@ -782,21 +806,25 @@ func readHTTPResponse(conn net.Conn) (status int, headers map[string]string, bod
 	} else if cl := headers["content-length"]; cl != "" {
 		remaining, _ := strconv.Atoi(cl)
 		remaining -= len(body)
-		for remaining > 0 {
-			conn.SetDeadline(time.Now().Add(20 * time.Second))
-			size := remaining
-			if size > 65536 {
-				size = 65536
+		if remaining > 0 {
+			chunkPtr := bufPool64k.Get().(*[]byte)
+			chunk := *chunkPtr
+			for remaining > 0 {
+				conn.SetDeadline(time.Now().Add(20 * time.Second))
+				size := remaining
+				if size > 65536 {
+					size = 65536
+				}
+				n, e := conn.Read(chunk[:size])
+				if n > 0 {
+					body = append(body, chunk[:n]...)
+					remaining -= n
+				}
+				if e != nil {
+					break
+				}
 			}
-			tmp2 := make([]byte, size)
-			n, e := conn.Read(tmp2)
-			if n > 0 {
-				body = append(body, tmp2[:n]...)
-				remaining -= n
-			}
-			if e != nil {
-				break
-			}
+			bufPool64k.Put(chunkPtr)
 		}
 	}
 
@@ -873,8 +901,7 @@ func parseRelayResponse(body []byte) ([]byte, error) {
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(text), &data); err != nil {
 		// Try to extract JSON
-		re := regexp.MustCompile(`\{.*\}`)
-		m := re.FindString(text)
+		m := reJSONExtract.FindString(text)
 		if m == "" {
 			return errorResponse(502, fmt.Sprintf("No JSON: %.200s", text)), nil
 		}
@@ -890,8 +917,7 @@ func parseBatchBody(body []byte, payloads []map[string]interface{}) ([][]byte, e
 	text := strings.TrimSpace(string(body))
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(text), &data); err != nil {
-		re := regexp.MustCompile(`\{.*\}`)
-		m := re.FindString(text)
+		m := reJSONExtract.FindString(text)
 		if m == "" {
 			return nil, fmt.Errorf("bad batch response: %.200s", text)
 		}
@@ -1004,8 +1030,7 @@ func splitHTTPResponse(raw []byte) (status int, headers map[string]string, body 
 	headerSection := raw[:sep]
 	body = raw[sep+4:]
 	lines := bytes.Split(headerSection, []byte("\r\n"))
-	re := regexp.MustCompile(`\d{3}`)
-	if m := re.Find(lines[0]); m != nil {
+	if m := reStatusCode.Find(lines[0]); m != nil {
 		status, _ = strconv.Atoi(string(m))
 	}
 	for _, line := range lines[1:] {
@@ -1028,7 +1053,7 @@ func rewrite206to200(raw []byte) []byte {
 	body := raw[idx+4:]
 	lines := strings.Split(headerSection, "\r\n")
 	if len(lines) > 0 && strings.Contains(lines[0], " 206") {
-		lines[0] = regexp.MustCompile(` 206[^\r]*`).ReplaceAllString(lines[0], " 200 OK")
+		lines[0] = reStatus206.ReplaceAllString(lines[0], " 200 OK")
 	}
 	filtered := []string{lines[0]}
 	for _, ln := range lines[1:] {
@@ -1096,13 +1121,10 @@ func IsLikelyDownload(url string) bool {
 	return false
 }
 
+// headerValue returns the header value for the given lowercase key.
+// All header maps in this package store keys in lowercase.
 func headerValue(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.ToLower(k) == name {
-			return v
-		}
-	}
-	return ""
+	return headers[name]
 }
 
 func stringFromMap(m map[string]interface{}, key string) string {
